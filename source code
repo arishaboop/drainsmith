@@ -1,0 +1,1637 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "driver/gpio.h"
+
+// ============================================================
+// SEWER CLEANING ROBOT - ESP32 WEB CONTROLLER  (v2)
+// Works on Arduino-ESP32 core 2.x AND 3.x (PWM shim below).
+// No ESP32Servo library needed: the servo uses LEDC directly.
+// The web page is fully self-contained (no internet / CDN needed,
+// because the ESP32 is its own WiFi access point).
+// ============================================================
+
+const char*   WIFI_SSID        = "Robot_Control";
+const char*   WIFI_PASSWORD    = "12345678";   // CHANGE THIS before real use (min 8 chars)
+const uint8_t WIFI_CHANNEL     = 1;
+const uint8_t WIFI_MAX_CLIENTS = 2;            // fewer clients = more responsive control
+
+WebServer server(80);
+
+// ============================================================
+// TYPES
+// ============================================================
+enum DriveState    { DRIVE_STOP, DRIVE_FORWARD, DRIVE_BACKWARD, DRIVE_LEFT, DRIVE_RIGHT,
+                     DRIVE_SPIN_LEFT, DRIVE_SPIN_RIGHT };   // spins are used by auto mode
+enum ConveyorState { CONV_STOP, CONV_FORWARD, CONV_REVERSE };
+enum AutoState     { AUTO_SCAN, AUTO_ALIGN, AUTO_APPROACH, AUTO_COLLECT, AUTO_BACKUP };
+
+// ============================================================
+// PINS
+// Strapping-pin notes (rewire if you ever see boot problems):
+//   GPIO 12 (TRIG) : must be LOW at boot or the ESP32 may fail to start.
+//   GPIO 15        : pulled HIGH at boot silences the boot log.
+//   GPIO 5, 14, 15 : output a short PWM burst during boot (motor twitch / buzzer chirp).
+// Fitting a 10k pull-down on each motor driver input removes boot twitching.
+// ============================================================
+const uint8_t SERVO_PIN  = 21;
+const uint8_t BUZZER_PIN = 14;
+const uint8_t TRIG_PIN   = 12;
+const uint8_t ECHO_PIN   = 13;   // HC-SR04 echo is 5V: use a 1k/2k voltage divider!
+const uint8_t LDR_PIN    = 34;   // ADC1 (works with WiFi on), input-only
+
+// ============================================================
+// PWM SHIM (core 2.x uses channels, core 3.x uses pins)
+//   channels 0-7 -> motors (5 kHz, 8 bit)   [high-speed group]
+//   channel  8   -> servo  (50 Hz, 14 bit)  [low-speed group]
+// ============================================================
+void pwmAttach(uint8_t pin, uint8_t ch, uint32_t freq, uint8_t bits)
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttachChannel(pin, freq, bits, ch);
+#else
+    ledcSetup(ch, freq, bits);
+    ledcAttachPin(pin, ch);
+#endif
+}
+
+void pwmWrite(uint8_t pin, uint8_t ch, uint32_t duty)
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWrite(pin, duty);
+#else
+    ledcWrite(ch, duty);
+#endif
+}
+
+// ============================================================
+// MOTORS
+// ============================================================
+const uint8_t  BASE_PWM        = 120;    // default ~47% speed
+const uint32_t MOTOR_PWM_FREQ  = 5000;
+const uint8_t  MOTOR_PWM_BITS  = 8;
+const int      MIN_SPEED_PCT   = 20;     // below this most motors just stall
+
+// true  = wheels actively brake when stopped (holds the robot on a slope)
+// false = wheels coast when stopped
+const bool WHEEL_BRAKE = false;
+
+// ============================================================
+// ULTRASONIC RANGE SETTINGS
+// ============================================================
+// Air temperature changes the speed of sound (about 0.6 m/s per degree C).
+const float AIR_TEMP_C       = 20.0f;
+const float SOUND_CM_PER_US  = (331.3f + 0.606f * AIR_TEMP_C) / 10000.0f;
+
+const float SONAR_MIN_CM     = 2.0f;
+// HC-SR04 is rated for 400 cm. Accepting up to 450 cm lets the firmware use
+// every echo the sensor can actually deliver on a good (flat, square-on) target.
+const float SONAR_MAX_CM     = 450.0f;
+
+// ============================================================
+// AUTOMATIC MODE SETTINGS  (tune these on the bench; the detect range
+// and sweep limits can also be changed live from the web page)
+// ============================================================
+const int   AUTO_SWEEP_MIN_DEG  = 0;
+const int   AUTO_SWEEP_MAX_DEG  = 180;
+const int   AUTO_SWEEP_STEP_DEG = 4;
+
+const float AUTO_DETECT_CM = 150.0;  // objects closer than this are targets (was 50)
+const float AUTO_REACH_CM  = 10.0;   // "arrived" distance -> stop and run conveyor
+
+// 90 deg = straight ahead. If an object on the robot's LEFT shows up at a
+// LOWER servo angle in your build, set this to false.
+const bool  AUTO_ANGLE_HIGH_IS_LEFT = true;
+// If the robot spins the wrong way toward the object, flip this.
+const bool  AUTO_SWAP_TURN          = false;
+
+// Turning is time-based (there is no heading sensor). CALIBRATE this:
+// the serial monitor prints "turn LEFT 40 deg for 360 ms".
+const unsigned long AUTO_TURN_MS_PER_DEG = 9;
+const uint8_t       AUTO_TURN_PWM        = 150;
+const float         AUTO_ALIGN_TOLERANCE_DEG = 8.0;
+
+const unsigned long AUTO_CONVEYOR_MS          = 5000;
+const unsigned long AUTO_BACKUP_MS            = 800;     // 0 = off
+const unsigned long AUTO_APPROACH_TIMEOUT_MS  = 30000;   // longer: targets may now be further away
+const uint8_t       AUTO_LOST_READINGS        = 5;
+const bool          AUTO_REPEAT               = true;    // false = auto off after 1 collection
+
+// Live-adjustable copies (changed from the web page)
+float autoDetectCm  = AUTO_DETECT_CM;
+int   autoSweepMin  = AUTO_SWEEP_MIN_DEG;
+int   autoSweepMax  = AUTO_SWEEP_MAX_DEG;
+
+struct Motor
+{
+    uint8_t in1, in2;
+    uint8_t ch1, ch2;   // LEDC channels
+    bool    reversed;
+};
+
+//                    IN1  IN2  ch1 ch2 reversed
+Motor wheelLeft   = { 17,  5,   0,  1,  false };
+Motor wheelRight  = { 18,  19,  2,  3,  false };
+Motor conveyorA   = { 15,  25,  4,  5,  false };
+Motor conveyorB   = { 4,   16,  6,  7,  false };
+
+uint8_t driveSpeed    = BASE_PWM;
+uint8_t conveyorSpeed = BASE_PWM;
+
+uint8_t pctToPwm(int pct) { pct = constrain(pct, 0, 100); return (pct * 255 + 50) / 100; }
+int     pwmToPct(uint8_t v) { return (v * 100 + 127) / 255; }
+
+void motorInit(const Motor& m)
+{
+    pinMode(m.in1, OUTPUT);
+    pinMode(m.in2, OUTPUT);
+    pwmAttach(m.in1, m.ch1, MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+    pwmAttach(m.in2, m.ch2, MOTOR_PWM_FREQ, MOTOR_PWM_BITS);
+    pwmWrite(m.in1, m.ch1, 0);
+    pwmWrite(m.in2, m.ch2, 0);
+}
+
+void motorStop(const Motor& m)    // coast
+{
+    pwmWrite(m.in1, m.ch1, 0);
+    pwmWrite(m.in2, m.ch2, 0);
+}
+
+void motorBrake(const Motor& m)   // both inputs high = brake
+{
+    pwmWrite(m.in1, m.ch1, 255);
+    pwmWrite(m.in2, m.ch2, 255);
+}
+
+void motorRun(const Motor& m, bool forward, uint8_t speed)
+{
+    if (m.reversed) forward = !forward;
+    pwmWrite(m.in1, m.ch1, forward ? speed : 0);
+    pwmWrite(m.in2, m.ch2, forward ? 0     : speed);
+}
+
+void wheelHalt(const Motor& m)
+{
+    if (WHEEL_BRAKE) motorBrake(m);
+    else             motorStop(m);
+}
+
+// ============================================================
+// DRIVE + CONVEYOR STATE
+// ============================================================
+const char* DRIVE_NAMES[]    = { "STOP", "FORWARD", "BACKWARD", "LEFT", "RIGHT",
+                                  "SPIN LEFT", "SPIN RIGHT" };
+const char* CONVEYOR_NAMES[] = { "STOP", "FORWARD", "REVERSE" };
+
+DriveState    driveState    = DRIVE_STOP;
+ConveyorState conveyorState = CONV_STOP;
+
+unsigned long lastDriveCommand = 0;
+const unsigned long DRIVE_TIMEOUT = 700;   // stop wheels if no command for 700 ms
+
+// Fail-safe: if the controller page disappears, stop EVERYTHING
+unsigned long lastClientContact = 0;
+const unsigned long CLIENT_TIMEOUT = 3000;
+
+void touchClient() { lastClientContact = millis(); }
+
+void applyDrive()
+{
+    switch (driveState)
+    {
+        case DRIVE_FORWARD:
+            motorRun(wheelLeft,  true,  driveSpeed);
+            motorRun(wheelRight, true,  driveSpeed);
+            break;
+        case DRIVE_BACKWARD:
+            motorRun(wheelLeft,  false, driveSpeed);
+            motorRun(wheelRight, false, driveSpeed);
+            break;
+        case DRIVE_LEFT:               // turn left: RIGHT wheel drives, left wheel holds (pivot)
+            wheelHalt(wheelLeft);
+            motorRun(wheelRight, true, driveSpeed);
+            break;
+        case DRIVE_RIGHT:              // turn right: LEFT wheel drives, right wheel holds (pivot)
+            motorRun(wheelLeft, true, driveSpeed);
+            wheelHalt(wheelRight);
+            break;
+        case DRIVE_SPIN_LEFT:          // rotate counter-clockwise on the spot
+            motorRun(wheelLeft,  false, AUTO_TURN_PWM);
+            motorRun(wheelRight, true,  AUTO_TURN_PWM);
+            break;
+        case DRIVE_SPIN_RIGHT:         // rotate clockwise on the spot
+            motorRun(wheelLeft,  true,  AUTO_TURN_PWM);
+            motorRun(wheelRight, false, AUTO_TURN_PWM);
+            break;
+        default:
+            wheelHalt(wheelLeft);
+            wheelHalt(wheelRight);
+            break;
+    }
+}
+
+void setDrive(DriveState s)
+{
+    driveState = s;
+    applyDrive();
+    if (s != DRIVE_STOP) lastDriveCommand = millis();
+}
+
+void applyConveyor()
+{
+    switch (conveyorState)
+    {
+        case CONV_FORWARD:
+            motorRun(conveyorA, true, conveyorSpeed);
+            motorRun(conveyorB, true, conveyorSpeed);
+            break;
+        case CONV_REVERSE:
+            motorRun(conveyorA, false, conveyorSpeed);
+            motorRun(conveyorB, false, conveyorSpeed);
+            break;
+        default:
+            motorStop(conveyorA);
+            motorStop(conveyorB);
+            break;
+    }
+}
+
+void setConveyor(ConveyorState s)
+{
+    conveyorState = s;
+    applyConveyor();
+}
+
+// ============================================================
+// SERVO (direct LEDC, 50 Hz, 14 bit)
+// ============================================================
+const uint8_t  SERVO_CH   = 8;
+const uint32_t SERVO_FREQ = 50;
+const uint8_t  SERVO_BITS = 14;
+int servoAngle = 90;
+
+void servoWrite(int angle)
+{
+    angle = constrain(angle, 0, 180);
+    uint32_t us   = map(angle, 0, 180, 500, 2400);          // pulse width in microseconds
+    uint32_t duty = (us * (1UL << SERVO_BITS)) / 20000UL;   // 20 ms period
+    pwmWrite(SERVO_PIN, SERVO_CH, duty);
+    servoAngle = angle;
+}
+
+// Moves the servo and records when it should have arrived, so the
+// ultrasonic readings taken while it was still moving can be ignored.
+unsigned long servoReadyAt = 0;
+
+void servoMoveTo(int angle)
+{
+    angle = constrain(angle, 0, 180);
+    int delta = abs(angle - servoAngle);
+    servoWrite(angle);
+    servoReadyAt = millis() + 60 + (unsigned long)delta * 3;
+}
+
+// ============================================================
+// BUZZER
+// ============================================================
+bool autoBuzzer   = true;
+bool manualBuzzer = false;
+bool buzzerState  = false;
+
+unsigned long manualBuzzerUntil = 0;
+unsigned long lastBeepChange    = 0;
+
+const unsigned long BEEP_ON_TIME  = 100;
+const unsigned long BEEP_OFF_TIME = 150;
+
+void setBuzzer(bool on)
+{
+    digitalWrite(BUZZER_PIN, on ? HIGH : LOW);
+    buzzerState = on;
+}
+
+// ============================================================
+// ULTRASONIC (non-blocking: echo timed by an interrupt, no pulseIn)
+// ============================================================
+float distanceCM       = -1.0;   // raw reading (used by auto mode and the radar)
+float distanceFiltered = -1.0;   // median of the last 3 (used for the big display)
+bool  detected         = false;
+
+const float         ALERT_DISTANCE_CM   = 10.0;
+const float         ALERT_HYSTERESIS_CM = 2.0;
+// 80 ms between pings lets long-range echoes die out before the next ping.
+const unsigned long SONAR_INTERVAL      = 80;
+// Round trip at 450 cm is ~26 ms; 35 ms gives margin (the HC-SR04 itself gives up at ~38 ms).
+const unsigned long SONAR_TIMEOUT_MS    = 35;
+const unsigned long SONAR_LOG_INTERVAL  = 1000;
+
+volatile uint32_t echoStartUs    = 0;
+volatile uint32_t echoDurationUs = 0;
+volatile bool     echoStarted    = false;
+volatile bool     echoDone       = false;
+
+bool          sonarWaiting     = false;
+unsigned long sonarTriggeredAt = 0;
+unsigned long lastSonarRead    = 0;
+unsigned long lastSonarLog     = 0;
+uint8_t       closeCount       = 0;
+int           pingAngle        = 90;   // servo angle when the ping was sent
+
+uint32_t      readingSeq            = 0;   // increments on every completed reading
+unsigned long lastReadingStartedAt  = 0;   // when that reading's ping was sent
+int           lastReadingAngle      = 90;  // servo angle of that reading (for the radar)
+
+float   medianBuf[3] = { -1, -1, -1 };
+uint8_t medianIdx    = 0;
+
+// Median of the last 3 readings: removes single-sample spikes and dropouts.
+float median3(float d)
+{
+    medianBuf[medianIdx] = d;
+    medianIdx = (medianIdx + 1) % 3;
+
+    float v[3];
+    for (int i = 0; i < 3; i++) v[i] = (medianBuf[i] < 0) ? 9999.0f : medianBuf[i];
+
+    float t;
+    if (v[0] > v[1]) { t = v[0]; v[0] = v[1]; v[1] = t; }
+    if (v[1] > v[2]) { t = v[1]; v[1] = v[2]; v[2] = t; }
+    if (v[0] > v[1]) { t = v[0]; v[0] = v[1]; v[1] = t; }
+
+    return (v[1] >= 9999.0f) ? -1.0f : v[1];
+}
+
+void IRAM_ATTR echoISR()
+{
+    if (gpio_get_level((gpio_num_t)ECHO_PIN))
+    {
+        echoStartUs = micros();
+        echoStarted = true;
+    }
+    else if (echoStarted)
+    {
+        echoDurationUs = micros() - echoStartUs;
+        echoStarted = false;
+        echoDone = true;
+    }
+}
+
+bool objectDetected() { return detected; }
+
+void processReading(float d)
+{
+    distanceCM = d;
+    distanceFiltered = median3(d);
+    lastReadingStartedAt = sonarTriggeredAt;
+    lastReadingAngle = pingAngle;
+    readingSeq++;
+
+    // Need 2 close readings in a row to alarm, and a clear margin to release.
+    if (d >= 0.0 && d <= ALERT_DISTANCE_CM)
+    {
+        if (closeCount < 255) closeCount++;
+        if (closeCount >= 2) detected = true;
+    }
+    else if (d < 0.0 || d > ALERT_DISTANCE_CM + ALERT_HYSTERESIS_CM)
+    {
+        closeCount = 0;
+        detected = false;
+    }
+
+    unsigned long now = millis();
+    if (now - lastSonarLog >= SONAR_LOG_INTERVAL)
+    {
+        lastSonarLog = now;
+        if (d >= 0.0) Serial.printf("Ultrasonic: %.1f cm\n", d);
+        else          Serial.println("Ultrasonic: NO ECHO");
+    }
+}
+
+void updateUltrasonic()
+{
+    unsigned long now = millis();
+
+    if (sonarWaiting)
+    {
+        if (echoDone)
+        {
+            sonarWaiting = false;
+            float d = (echoDurationUs * SOUND_CM_PER_US) / 2.0f;
+            processReading((d >= SONAR_MIN_CM && d <= SONAR_MAX_CM) ? d : -1.0f);
+        }
+        else if (now - sonarTriggeredAt > SONAR_TIMEOUT_MS)
+        {
+            sonarWaiting = false;
+            processReading(-1.0f);
+        }
+        return;
+    }
+
+    if (now - lastSonarRead < SONAR_INTERVAL) return;
+    lastSonarRead = now;
+
+    echoDone    = false;
+    echoStarted = false;
+
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    sonarTriggeredAt = now;
+    pingAngle = servoAngle;
+    sonarWaiting = true;
+}
+
+// ============================================================
+// LDR (averaged + hysteresis so it doesn't flicker)
+// ============================================================
+int  ldrValue = 0;
+bool inSewer  = false;
+
+const int LDR_DARK_BELOW  = 1400;   // below this -> in sewer (tune for your divider)
+const int LDR_LIGHT_ABOVE = 1600;   // above this -> not in sewer
+const unsigned long LDR_INTERVAL = 50;
+unsigned long lastLdrRead = 0;
+
+void updateLDR()
+{
+    unsigned long now = millis();
+    if (now - lastLdrRead < LDR_INTERVAL) return;
+    lastLdrRead = now;
+
+    long sum = 0;
+    for (int i = 0; i < 8; i++) sum += analogRead(LDR_PIN);
+    ldrValue = sum / 8;
+
+    if (ldrValue < LDR_DARK_BELOW)       inSewer = true;
+    else if (ldrValue > LDR_LIGHT_ABOVE) inSewer = false;
+}
+
+// ============================================================
+// BUZZER LOGIC
+// ============================================================
+void updateBuzzer()
+{
+    unsigned long now = millis();
+
+    if (manualBuzzer)
+    {
+        if ((long)(manualBuzzerUntil - now) > 0)
+        {
+            setBuzzer(true);
+            return;
+        }
+        manualBuzzer = false;
+    }
+
+    if (!autoBuzzer || !objectDetected())
+    {
+        setBuzzer(false);
+        return;
+    }
+
+    unsigned long wait = buzzerState ? BEEP_ON_TIME : BEEP_OFF_TIME;
+    if (now - lastBeepChange >= wait)
+    {
+        setBuzzer(!buzzerState);
+        lastBeepChange = now;
+    }
+}
+
+// ============================================================
+// FAIL-SAFE
+// ============================================================
+void stopAll()
+{
+    setDrive(DRIVE_STOP);
+    setConveyor(CONV_STOP);
+}
+
+// ============================================================
+// AUTOMATIC MODE
+// The sensor is mounted on the servo. The servo sweeps; when the
+// sensor sees an object the robot turns toward it, drives up to it,
+// runs the conveyor for AUTO_CONVEYOR_MS, backs off and scans again.
+// ============================================================
+const char* AUTO_NAMES[] = { "SCANNING", "TURNING", "APPROACHING", "COLLECTING", "BACKING UP" };
+
+bool          autoMode       = false;
+AutoState     autoState      = AUTO_SCAN;
+unsigned long autoStateSince = 0;
+uint32_t      autoLastSeq    = 0;
+uint16_t      collectedCount = 0;
+
+int     sweepAngle    = 90;
+int     sweepDir      = 1;
+bool    tracking      = false;
+uint8_t hitConfirm    = 0;
+uint8_t missCount     = 0;
+int     firstHitAngle = 90;
+int     lastHitAngle  = 90;
+float   closestCm     = 0;
+
+unsigned long turnUntil  = 0;
+uint8_t       reachCount = 0;
+uint8_t       lostCount  = 0;
+
+void autoSetState(AutoState s)
+{
+    autoState = s;
+    autoStateSince = millis();
+}
+
+// true once per NEW reading that was taken after the servo had settled
+bool autoFreshReading()
+{
+    if (readingSeq == autoLastSeq) return false;
+    autoLastSeq = readingSeq;
+    return (long)(lastReadingStartedAt - servoReadyAt) >= 0;
+}
+
+void autoBeginScan()
+{
+    setDrive(DRIVE_STOP);
+    setConveyor(CONV_STOP);
+    tracking = false;
+    hitConfirm = 0;
+    missCount = 0;
+    sweepAngle = autoSweepMin;
+    sweepDir = 1;
+    servoMoveTo(sweepAngle);
+    autoLastSeq = readingSeq;
+    autoSetState(AUTO_SCAN);
+}
+
+void autoEnable()
+{
+    stopAll();
+    autoMode = true;
+    Serial.println("AUTO: ON");
+    autoBeginScan();
+}
+
+void autoDisable()
+{
+    if (autoMode)
+    {
+        autoMode = false;
+        servoMoveTo(90);
+        Serial.println("AUTO: OFF");
+    }
+    stopAll();
+}
+
+void autoStartApproach()
+{
+    reachCount = 0;
+    lostCount = 0;
+    unsigned long ready = millis() + 150;      // let the robot settle after turning
+    if ((long)(servoReadyAt - ready) < 0) servoReadyAt = ready;
+    autoLastSeq = readingSeq;
+    autoSetState(AUTO_APPROACH);
+}
+
+void autoTargetFound()
+{
+    int   target = (firstHitAngle + lastHitAngle) / 2;   // middle of the object
+    int   offset = target - 90;                          // + = toward higher servo angles
+    int   mag    = abs(offset);
+    bool  left   = AUTO_ANGLE_HIGH_IS_LEFT ? (offset > 0) : (offset < 0);
+
+    Serial.printf("AUTO: object at %d deg, %.1f cm\n", target, closestCm);
+
+    servoMoveTo(90);   // sensor now looks straight ahead
+
+    if (mag <= AUTO_ALIGN_TOLERANCE_DEG)
+    {
+        autoStartApproach();
+        return;
+    }
+
+    bool spinLeft = AUTO_SWAP_TURN ? !left : left;
+    unsigned long ms = (unsigned long)mag * AUTO_TURN_MS_PER_DEG;
+    Serial.printf("AUTO: turn %s %d deg for %lu ms\n", spinLeft ? "LEFT" : "RIGHT", mag, ms);
+
+    setDrive(spinLeft ? DRIVE_SPIN_LEFT : DRIVE_SPIN_RIGHT);
+    turnUntil = millis() + ms;
+    autoSetState(AUTO_ALIGN);
+}
+
+void autoReached()
+{
+    setDrive(DRIVE_STOP);
+    setConveyor(CONV_FORWARD);
+    Serial.printf("AUTO: reached target, conveyor on for %lu ms\n", AUTO_CONVEYOR_MS);
+    autoSetState(AUTO_COLLECT);
+}
+
+void autoUpdate()
+{
+    if (!autoMode) return;
+    unsigned long now = millis();
+
+    switch (autoState)
+    {
+        case AUTO_SCAN:
+        {
+            if (!autoFreshReading()) return;
+
+            float d = distanceCM;
+            bool hit = (d >= 0.0f && d <= autoDetectCm);
+            bool finished = false;
+
+            if (!tracking)
+            {
+                // need 2 hits in a row to believe it
+                if (hit)
+                {
+                    if (hitConfirm == 0) { firstHitAngle = servoAngle; closestCm = d; }
+                    if (d < closestCm) closestCm = d;
+                    if (++hitConfirm >= 2)
+                    {
+                        tracking = true;
+                        lastHitAngle = servoAngle;
+                        missCount = 0;
+                    }
+                }
+                else hitConfirm = 0;
+            }
+            else
+            {
+                // keep sweeping until the object ends, so we aim at its middle
+                if (hit)
+                {
+                    lastHitAngle = servoAngle;
+                    missCount = 0;
+                    if (d < closestCm) closestCm = d;
+                }
+                else if (++missCount >= 2) finished = true;
+            }
+
+            bool atEnd = (servoAngle <= autoSweepMin || servoAngle >= autoSweepMax);
+            if (finished || (tracking && atEnd))
+            {
+                autoTargetFound();
+                return;
+            }
+
+            int next = sweepAngle + sweepDir * AUTO_SWEEP_STEP_DEG;
+            if (next >= autoSweepMax)      { next = autoSweepMax; sweepDir = -1; }
+            else if (next <= autoSweepMin) { next = autoSweepMin; sweepDir = 1;  }
+            sweepAngle = next;
+            servoMoveTo(sweepAngle);
+            break;
+        }
+
+        case AUTO_ALIGN:
+            if ((long)(now - turnUntil) >= 0)
+            {
+                setDrive(DRIVE_STOP);
+                autoStartApproach();
+            }
+            break;
+
+        case AUTO_APPROACH:
+        {
+            if (now - autoStateSince > AUTO_APPROACH_TIMEOUT_MS)
+            {
+                Serial.println("AUTO: approach timed out, rescanning");
+                autoBeginScan();
+                return;
+            }
+            if (!autoFreshReading()) return;
+
+            float d = distanceCM;
+
+            if (d >= 0.0f && d <= AUTO_REACH_CM)
+            {
+                if (++reachCount >= 2) { autoReached(); return; }
+            }
+            else reachCount = 0;
+
+            bool visible = (d >= 0.0f && d <= autoDetectCm + 15.0f);
+            if (visible)
+            {
+                lostCount = 0;
+                if (driveState != DRIVE_FORWARD) setDrive(DRIVE_FORWARD);
+            }
+            else if (++lostCount >= AUTO_LOST_READINGS)
+            {
+                Serial.println("AUTO: lost the target, rescanning");
+                autoBeginScan();
+                return;
+            }
+            break;
+        }
+
+        case AUTO_COLLECT:
+            if (now - autoStateSince >= AUTO_CONVEYOR_MS)
+            {
+                setConveyor(CONV_STOP);
+                collectedCount++;
+                Serial.printf("AUTO: done (%u collected)\n", (unsigned)collectedCount);
+
+                if (!AUTO_REPEAT)           { autoDisable(); return; }
+                if (AUTO_BACKUP_MS > 0)     { setDrive(DRIVE_BACKWARD); autoSetState(AUTO_BACKUP); }
+                else                        autoBeginScan();
+            }
+            break;
+
+        case AUTO_BACKUP:
+            if (now - autoStateSince >= AUTO_BACKUP_MS)
+            {
+                setDrive(DRIVE_STOP);
+                autoBeginScan();
+            }
+            break;
+    }
+}
+
+// ============================================================
+// STATUS JSON (no String concatenation -> no heap fragmentation)
+// ============================================================
+void fmtDist(char* out, size_t n, float d)
+{
+    if (d < 0) snprintf(out, n, "null");
+    else       snprintf(out, n, "%.1f", d);
+}
+
+void handleStatus()
+{
+    touchClient();
+
+    char dist[12], rdist[12];
+    fmtDist(dist,  sizeof(dist),  distanceFiltered);
+    fmtDist(rdist, sizeof(rdist), distanceCM);
+
+    char json[720];
+    int n = snprintf(json, sizeof(json),
+        "{\"drive\":\"%s\",\"conveyor\":\"%s\",\"servo\":%d,"
+        "\"distance\":%s,\"rDist\":%s,\"rAngle\":%d,\"seq\":%lu,"
+        "\"detected\":%s,\"autoBuzzer\":%s,\"buzzer\":%s,"
+        "\"ldr\":%d,\"inSewer\":%s,"
+        "\"driveSpeed\":%d,\"convSpeed\":%d,"
+        "\"auto\":%s,\"autoState\":\"%s\",\"collected\":%u,"
+        "\"detectCm\":%d,\"swMin\":%d,\"swMax\":%d,\"maxCm\":%d,\"highLeft\":%s}",
+        DRIVE_NAMES[driveState],
+        CONVEYOR_NAMES[conveyorState],
+        servoAngle,
+        dist,
+        rdist,
+        lastReadingAngle,
+        (unsigned long)readingSeq,
+        objectDetected() ? "true" : "false",
+        autoBuzzer       ? "true" : "false",
+        buzzerState      ? "true" : "false",
+        ldrValue,
+        inSewer          ? "true" : "false",
+        pwmToPct(driveSpeed),
+        pwmToPct(conveyorSpeed),
+        autoMode ? "true" : "false",
+        autoMode ? AUTO_NAMES[autoState] : "OFF",
+        (unsigned)collectedCount,
+        (int)autoDetectCm,
+        autoSweepMin,
+        autoSweepMax,
+        (int)SONAR_MAX_CM,
+        AUTO_ANGLE_HIGH_IS_LEFT ? "true" : "false");
+
+    if (n < 0 || n >= (int)sizeof(json))
+    {
+        server.send(500, "text/plain", "status too large");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
+}
+
+// ============================================================
+// WEBSITE
+// ============================================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#050d16">
+<title>Sewer Bot Console</title>
+<style>
+:root{--bg:#050d16;--card:#0b1a29;--card2:#102338;--line:#1c3752;--txt:#e6f1fa;--mut:#7f9bb5;
+      --acc:#22d3ee;--ok:#10b981;--warn:#f59e0b;--bad:#ef4444;--vio:#8b5cf6}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;padding:0 14px 110px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+     color:var(--txt);user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
+     background:radial-gradient(1200px 600px at 50% -200px,#0f2c45 0,var(--bg) 70%) fixed}
+header{display:flex;align-items:center;justify-content:space-between;gap:10px;max-width:1180px;margin:0 auto;padding:16px 2px 6px}
+.brand{display:flex;align-items:center;gap:12px}
+.brand svg{width:44px;height:44px;flex:none}
+h1{margin:0;font-size:22px;letter-spacing:3px;font-weight:800}
+h1 span{color:var(--acc)}
+.brand small{display:block;color:var(--mut);font-size:12px;letter-spacing:.5px;margin-top:2px}
+.pill{display:flex;align-items:center;gap:8px;padding:7px 14px;border-radius:99px;font-size:12px;font-weight:700;
+      letter-spacing:1px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.5);color:#6ee7b7;white-space:nowrap}
+.pill i{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok);animation:pulse 1.6s infinite}
+.pill em{font-style:normal;color:var(--mut);font-weight:600}
+.pill.off{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.5);color:#fca5a5}
+.pill.off i{background:var(--bad);box-shadow:0 0 10px var(--bad);animation:none}
+@keyframes pulse{50%{opacity:.35}}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;max-width:1180px;margin:10px auto 0}
+.card{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:20px;
+      padding:18px;box-shadow:0 8px 30px rgba(0,0,0,.35);position:relative}
+.card.wide{grid-column:1/-1}
+.card h2{margin:0 0 12px;font-size:13px;letter-spacing:2px;text-transform:uppercase;color:var(--mut);
+         display:flex;align-items:center;gap:8px;font-weight:700}
+.card h2 b{width:6px;height:16px;border-radius:3px;background:var(--acc);display:inline-block}
+.row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+button{font:inherit;border:1px solid var(--line);border-radius:14px;padding:14px 18px;color:var(--txt);cursor:pointer;
+       background:#14314b;font-weight:700;letter-spacing:.5px;touch-action:manipulation;transition:transform .08s,background .15s,box-shadow .15s}
+button:hover{background:#1a3d5e}
+button:active,button.on{transform:scale(.96);background:#0e7490;box-shadow:0 0 18px rgba(34,211,238,.45)}
+button.go{background:#065f46;border-color:#059669}button.go:hover{background:#047857}
+button.stop{background:#7f1d1d;border-color:#b91c1c}button.stop:hover{background:#991b1b}
+button.vio{background:#4c1d95;border-color:#7c3aed}button.vio:hover{background:#5b21b6}
+button.sm{padding:8px 12px;font-size:12px;border-radius:10px}
+button.sel{background:#0e7490;border-color:var(--acc)}
+.big{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:46px;font-weight:800;color:#67e8f9;line-height:1}
+.big small{font-size:16px;color:var(--mut);margin-left:6px}
+.tag{display:inline-block;padding:6px 14px;border-radius:99px;font-size:12px;font-weight:800;letter-spacing:1.2px;
+     background:#12304a;color:#9ec3e0;border:1px solid var(--line)}
+.tag.ok{background:rgba(16,185,129,.14);color:#6ee7b7;border-color:rgba(16,185,129,.5)}
+.tag.warn{background:rgba(245,158,11,.14);color:#fcd34d;border-color:rgba(245,158,11,.6)}
+.tag.bad{background:rgba(239,68,68,.16);color:#fca5a5;border-color:rgba(239,68,68,.6);animation:blink .6s infinite alternate}
+@keyframes blink{to{opacity:.55}}
+.center{text-align:center}
+.mut{color:var(--mut);font-size:13px}
+.split{display:flex;justify-content:space-between;align-items:center;gap:10px}
+/* sliders */
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:30px;background:transparent;margin:4px 0;--p:50%}
+input[type=range]::-webkit-slider-runnable-track{height:8px;border-radius:6px;background:linear-gradient(90deg,var(--acc) var(--p),#1a3550 var(--p))}
+input[type=range]::-moz-range-track{height:8px;border-radius:6px;background:linear-gradient(90deg,var(--acc) var(--p),#1a3550 var(--p))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;margin-top:-9px;border-radius:50%;background:#fff;border:4px solid var(--acc);box-shadow:0 2px 8px rgba(0,0,0,.5)}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#fff;border:4px solid var(--acc)}
+.lab{display:flex;justify-content:space-between;font-size:13px;color:var(--mut);margin-top:10px}
+.lab b{color:var(--txt);font-family:ui-monospace,Menlo,Consolas,monospace}
+/* drive pad */
+.pad{display:grid;grid-template-columns:repeat(3,84px);grid-template-rows:repeat(3,84px);gap:10px;justify-content:center;margin:6px 0 14px}
+.pad button{padding:0;font-size:26px;border-radius:22px;touch-action:none}
+.pad .mid{background:#7f1d1d;border-color:#b91c1c;font-size:13px;letter-spacing:1px}
+kbd{background:#0a1826;border:1px solid var(--line);border-bottom-width:3px;border-radius:6px;padding:1px 6px;font-size:11px;color:var(--mut)}
+/* auto stepper */
+.steps{display:flex;gap:6px;margin:12px 0;flex-wrap:wrap;justify-content:center}
+.steps span{flex:1 1 auto;text-align:center;font-size:10px;font-weight:800;letter-spacing:1px;padding:8px 6px;border-radius:10px;
+            background:#0a1826;color:#4d6a84;border:1px solid var(--line);transition:.2s}
+.steps span.act{background:rgba(34,211,238,.15);color:var(--acc);border-color:var(--acc);box-shadow:0 0 14px rgba(34,211,238,.35)}
+.stat{display:flex;justify-content:space-around;margin:8px 0 14px;text-align:center}
+.stat div b{display:block;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:34px;color:#67e8f9}
+.stat div span{font-size:11px;color:var(--mut);letter-spacing:1.5px}
+details{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+summary{cursor:pointer;color:var(--mut);font-size:12px;letter-spacing:1.5px;font-weight:700;list-style:none}
+summary::before{content:"▸ "}details[open] summary::before{content:"▾ "}
+/* radar */
+#radar{width:100%;display:block;border-radius:14px;background:radial-gradient(ellipse at 50% 100%,#0a2a3a 0,#06141f 75%);border:1px solid var(--line)}
+.bar{height:10px;border-radius:6px;background:#0a1826;border:1px solid var(--line);overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ok),var(--warn),var(--bad));transition:width .25s}
+/* conveyor gear */
+.gear{width:64px;height:64px;color:var(--acc)}
+.gear.f{animation:spin 1.2s linear infinite}
+.gear.r{animation:spin 1.2s linear infinite reverse}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* LDR bar */
+.ldr{height:14px;border-radius:8px;background:linear-gradient(90deg,#020617,#475569,#fde68a);border:1px solid var(--line);position:relative;margin:12px 0 8px}
+.ldr i{position:absolute;top:-5px;width:6px;height:22px;border-radius:3px;background:#fff;box-shadow:0 0 8px #fff;left:0;transition:left .3s}
+/* log */
+#log{max-height:220px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;text-align:left}
+.ev{display:flex;gap:10px;padding:6px 4px;border-bottom:1px solid rgba(28,55,82,.6)}
+.ev time{color:var(--mut);flex:none}
+.ev.good{color:#6ee7b7}.ev.warn{color:#fcd34d}.ev.bad{color:#fca5a5}
+/* locks */
+body.locked [data-lock]{opacity:.3;pointer-events:none}
+body.offline main{opacity:.5;filter:grayscale(.6);pointer-events:none}
+/* bottom bar */
+#estop{position:fixed;left:0;right:0;bottom:0;padding:12px 14px calc(12px + env(safe-area-inset-bottom));
+       background:linear-gradient(180deg,transparent,rgba(5,13,22,.96) 40%);z-index:20}
+#estop button{display:block;width:100%;max-width:1180px;margin:0 auto;padding:18px;font-size:17px;letter-spacing:3px;
+       background:linear-gradient(180deg,#dc2626,#991b1b);border:1px solid #fca5a5;box-shadow:0 6px 24px rgba(220,38,38,.45)}
+/* toast + modal */
+#toast{position:fixed;top:14px;left:50%;transform:translate(-50%,-80px);padding:11px 18px;border-radius:12px;background:#0e7490;
+       color:#fff;font-weight:700;font-size:14px;z-index:40;transition:transform .25s;max-width:90vw;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,.5)}
+#toast.show{transform:translate(-50%,0)}#toast.bad{background:#b91c1c}
+#modal{position:fixed;inset:0;background:rgba(2,8,14,.8);display:none;align-items:center;justify-content:center;z-index:50;padding:20px}
+#modal.show{display:flex}
+#modal div{background:var(--card2);border:1px solid var(--line);border-radius:20px;padding:24px;max-width:380px;text-align:center}
+#modal h3{margin:0 0 8px;font-size:20px}#modal p{color:var(--mut);margin:0 0 18px;line-height:1.5}
+@media(max-width:420px){.pad{grid-template-columns:repeat(3,76px);grid-template-rows:repeat(3,76px)}h1{font-size:18px}.big{font-size:38px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 48 48" fill="none"><rect x="6" y="14" width="36" height="22" rx="7" fill="#102338" stroke="#22d3ee" stroke-width="2"/>
+      <circle cx="17" cy="25" r="4" fill="#22d3ee"/><circle cx="31" cy="25" r="4" fill="#22d3ee"/>
+      <rect x="4" y="34" width="12" height="8" rx="4" fill="#0e7490"/><rect x="32" y="34" width="12" height="8" rx="4" fill="#0e7490"/>
+      <path d="M24 14V7M20 7h8" stroke="#22d3ee" stroke-width="2" stroke-linecap="round"/></svg>
+    <div><h1>SEWER<span>BOT</span></h1><small>Pipe inspection &amp; cleaning console</small></div>
+  </div>
+  <div id="link" class="pill off"><i></i><b>CONNECTING</b><em></em></div>
+</header>
+
+<main>
+
+<section class="card">
+  <h2><b></b>Automatic Mission</h2>
+  <div class="center"><span class="tag" id="autoTag">STANDBY</span></div>
+  <div class="steps" id="steps">
+    <span data-s="SCANNING">SCAN</span><span data-s="TURNING">TURN</span><span data-s="APPROACHING">APPROACH</span>
+    <span data-s="COLLECTING">COLLECT</span><span data-s="BACKING UP">BACK UP</span>
+  </div>
+  <div class="stat"><div><b id="collected">0</b><span>OBJECTS COLLECTED</span></div></div>
+  <button class="go" style="width:100%;padding:18px;font-size:16px" id="autoBtn">▶ START AUTO MODE</button>
+  <details>
+    <summary>AUTO TUNING</summary>
+    <div class="lab"><span>Detect objects closer than</span><b><span id="detectVal">150</span> cm</b></div>
+    <input type="range" id="detect" min="20" max="450" value="150">
+    <div class="lab"><span>Sweep from</span><b><span id="swMinVal">0</span>°</b></div>
+    <input type="range" id="swMin" min="0" max="160" value="0">
+    <div class="lab"><span>Sweep to</span><b><span id="swMaxVal">180</span>°</b></div>
+    <input type="range" id="swMax" min="20" max="180" value="180">
+    <p class="mut">Tip: inside a pipe, narrow the sweep so the sensor doesn't chase the pipe walls.</p>
+  </details>
+</section>
+
+<section class="card">
+  <h2><b></b>Sonar Radar</h2>
+  <canvas id="radar"></canvas>
+  <div class="split" style="margin-top:12px">
+    <div class="big"><span id="distance">--</span><small>cm</small></div>
+    <div style="text-align:right"><span class="tag" id="sonarTag">WAITING</span>
+      <div class="mut" id="meters" style="margin-top:6px">&nbsp;</div></div>
+  </div>
+  <div class="bar"><i id="proxBar"></i></div>
+  <div class="row" style="margin-top:12px">
+    <span class="mut" style="align-self:center">Radar range</span>
+    <button class="sm" data-range="100">1 m</button><button class="sm sel" data-range="200">2 m</button>
+    <button class="sm" data-range="300">3 m</button><button class="sm" data-range="450">4.5 m</button>
+  </div>
+</section>
+
+<section class="card center" data-lockwrap>
+  <h2><b></b>Drive</h2>
+  <div class="tag" id="driveState" style="margin-bottom:10px">STOP</div>
+  <div data-lock>
+    <div class="pad">
+      <div></div><button data-dir="forward">▲</button><div></div>
+      <button data-dir="left">◀</button><button class="mid" id="stopBtn">STOP</button><button data-dir="right">▶</button>
+      <div></div><button data-dir="backward">▼</button><div></div>
+    </div>
+    <p class="mut">Hold to drive · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys · <kbd>Space</kbd> stops</p>
+  </div>
+  <div class="lab"><span>Wheel speed</span><b><span id="driveSpeedVal">47</span>%</b></div>
+  <input type="range" min="20" max="100" value="47" id="driveSpeed">
+</section>
+
+<section class="card center">
+  <h2><b></b>Conveyor</h2>
+  <svg class="gear" id="gear" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round">
+    <circle cx="32" cy="32" r="10"/><circle cx="32" cy="32" r="22" stroke-dasharray="8 6"/>
+    <path d="M32 6v8M32 50v8M6 32h8M50 32h8M14 14l6 6M44 44l6 6M14 50l6-6M44 20l6-6"/></svg>
+  <div class="tag" id="conveyorState" style="margin:8px 0 14px">STOP</div>
+  <div class="row" data-lock>
+    <button class="go" data-conv="forward">FORWARD</button>
+    <button class="vio" data-conv="reverse">REVERSE</button>
+    <button class="stop" data-conv="stop">STOP</button>
+  </div>
+  <div class="lab"><span>Conveyor speed</span><b><span id="convSpeedVal">47</span>%</b></div>
+  <input type="range" min="20" max="100" value="47" id="convSpeed">
+</section>
+
+<section class="card center">
+  <h2><b></b>Sensor Head (Servo)</h2>
+  <div class="big"><span id="servoValue">90</span><small>°</small></div>
+  <div data-lock>
+    <input type="range" min="0" max="180" value="90" id="servo">
+    <div class="row">
+      <button class="sm" data-angle="0">0°</button><button class="sm" data-angle="45">45°</button>
+      <button class="sm" data-angle="90">90°</button><button class="sm" data-angle="135">135°</button>
+      <button class="sm" data-angle="180">180°</button>
+    </div>
+  </div>
+</section>
+
+<section class="card center">
+  <h2><b></b>Environment</h2>
+  <div class="big"><span id="ldr">--</span></div>
+  <div class="ldr"><i id="ldrMark"></i></div>
+  <div class="mut split"><span>DARK</span><span>BRIGHT</span></div>
+  <div class="tag" id="sewerStatus" style="margin-top:12px">WAITING</div>
+</section>
+
+<section class="card center">
+  <h2><b></b>Buzzer</h2>
+  <div class="tag" id="buzzerStatus" style="margin-bottom:12px">OFF</div><br>
+  <button class="vio" id="testBuzzer">🔔 TEST BUZZER</button>
+  <p><label class="mut"><input type="checkbox" id="autoBuzzer" checked> Warn automatically at 10 cm</label></p>
+</section>
+
+<section class="card wide">
+  <h2><b></b>Mission Log</h2>
+  <div id="log"></div>
+</section>
+
+</main>
+
+<div id="estop"><button id="masterStop">⛔ EMERGENCY STOP</button></div>
+<div id="toast"></div>
+<div id="modal"><div><h3>Start auto mode?</h3>
+  <p>The robot will move by itself. It stops if this page is closed, hidden, or the connection drops.</p>
+  <div class="row"><button class="go" id="mYes">START</button><button id="mNo">CANCEL</button></div></div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const vib = ms => { try { navigator.vibrate && navigator.vibrate(ms); } catch(e){} };
+
+// ---------- helpers ----------
+let toastT;
+function toast(msg, bad){
+  const t = $("toast"); t.textContent = msg; t.className = "show" + (bad ? " bad" : "");
+  clearTimeout(toastT); toastT = setTimeout(() => t.className = "", 2400);
+}
+async function send(url){
+  const c = new AbortController(), to = setTimeout(() => c.abort(), 1500);
+  try {
+    const r = await fetch(url, {cache:"no-store", signal:c.signal});
+    if (r.status === 409) toast("Auto mode is running — stop it to take control", true);
+    else if (r.status >= 400) toast("Command rejected (" + r.status + ")", true);
+    return r;
+  } catch(e){ return null; } finally { clearTimeout(to); }
+}
+function log(msg, cls){
+  const d = document.createElement("div"); d.className = "ev " + (cls || "");
+  const t = document.createElement("time"); t.textContent = new Date().toLocaleTimeString([], {hour12:false});
+  const s = document.createElement("span"); s.textContent = msg;
+  d.append(t, s); $("log").prepend(d);
+  while ($("log").children.length > 40) $("log").lastChild.remove();
+}
+function paint(el){ el.style.setProperty("--p", ((el.value - el.min) / (el.max - el.min) * 100) + "%"); }
+function throttled(fn, ms){
+  let last = 0, timer = null, latest;
+  return v => {
+    latest = v;
+    const wait = ms - (Date.now() - last);
+    if (wait <= 0){ clearTimeout(timer); timer = null; last = Date.now(); fn(v); }
+    else if (!timer){ timer = setTimeout(() => { timer = null; last = Date.now(); fn(latest); }, wait); }
+  };
+}
+let autoOn = false;
+
+// ---------- DRIVE ----------
+let driveTimer = null, activeDir = null;
+function startDrive(dir){
+  if (autoOn || activeDir === dir) return;
+  clearInterval(driveTimer); activeDir = dir; vib(12);
+  send("/move?dir=" + dir);
+  driveTimer = setInterval(() => send("/move?dir=" + dir), 200);
+}
+function stopDrive(){
+  clearInterval(driveTimer); driveTimer = null; activeDir = null;
+  send("/move?dir=stop");
+}
+document.querySelectorAll("[data-dir]").forEach(btn => {
+  const dir = btn.dataset.dir;
+  btn.addEventListener("pointerdown", e => { e.preventDefault(); btn.setPointerCapture(e.pointerId); startDrive(dir); });
+  btn.addEventListener("pointerup", stopDrive);
+  btn.addEventListener("pointercancel", stopDrive);
+  btn.addEventListener("lostpointercapture", stopDrive);
+});
+$("stopBtn").addEventListener("click", () => { vib(30); stopDrive(); });
+document.addEventListener("contextmenu", e => e.preventDefault());
+
+// ---------- KEYBOARD ----------
+const KEYS = {ArrowUp:"forward", w:"forward", ArrowDown:"backward", s:"backward",
+              ArrowLeft:"left", a:"left", ArrowRight:"right", d:"right"};
+document.addEventListener("keydown", e => {
+  if (e.key === " ") { e.preventDefault(); stopDrive(); return; }
+  const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
+  if (dir) { e.preventDefault(); startDrive(dir); }
+});
+document.addEventListener("keyup", e => {
+  const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
+  if (dir && dir === activeDir) stopDrive();
+});
+
+// ---------- CONVEYOR ----------
+document.querySelectorAll("[data-conv]").forEach(btn =>
+  btn.addEventListener("click", () => { vib(15); send("/conveyor?state=" + btn.dataset.conv); }));
+
+// ---------- SLIDERS ----------
+const busy = new Set();
+window.addEventListener("pointerup", () => busy.clear());
+window.addEventListener("pointercancel", () => busy.clear());
+function bindSlider(id, labelId, makeUrl){
+  const el = $(id), push = throttled(v => send(makeUrl(v)), 80);
+  paint(el);
+  el.addEventListener("pointerdown", () => busy.add(id));
+  el.addEventListener("input", () => { $(labelId).textContent = el.value; paint(el); push(el.value); });
+}
+bindSlider("servo", "servoValue", v => "/servo?angle=" + v);
+bindSlider("driveSpeed", "driveSpeedVal", v => "/speed?target=drive&value=" + v);
+bindSlider("convSpeed", "convSpeedVal", v => "/speed?target=conveyor&value=" + v);
+
+document.querySelectorAll("[data-angle]").forEach(btn =>
+  btn.addEventListener("click", () => {
+    $("servo").value = btn.dataset.angle; $("servoValue").textContent = btn.dataset.angle; paint($("servo"));
+    send("/servo?angle=" + btn.dataset.angle);
+  }));
+
+// auto tuning sliders
+const pushCfg = throttled(() => send("/auto-config?detect=" + $("detect").value +
+                                     "&min=" + $("swMin").value + "&max=" + $("swMax").value), 150);
+function cfgSlider(id, labelId){
+  const el = $(id); paint(el);
+  el.addEventListener("pointerdown", () => busy.add(id));
+  el.addEventListener("input", () => {
+    if (id === "swMin" && +$("swMin").value > +$("swMax").value - 20){
+      $("swMax").value = +$("swMin").value + 20; $("swMaxVal").textContent = $("swMax").value; paint($("swMax"));
+    }
+    if (id === "swMax" && +$("swMax").value < +$("swMin").value + 20){
+      $("swMin").value = +$("swMax").value - 20; $("swMinVal").textContent = $("swMin").value; paint($("swMin"));
+    }
+    $(labelId).textContent = el.value; paint(el); pushCfg();
+  });
+}
+cfgSlider("detect", "detectVal"); cfgSlider("swMin", "swMinVal"); cfgSlider("swMax", "swMaxVal");
+
+// ---------- BUZZER ----------
+$("testBuzzer").addEventListener("click", () => { vib(20); send("/buzzer?test=1"); });
+$("autoBuzzer").addEventListener("change", e => send("/buzzer?auto=" + (e.target.checked ? "1" : "0")));
+
+// ---------- MASTER STOP ----------
+$("masterStop").addEventListener("click", () => {
+  vib([60, 40, 60]); clearInterval(driveTimer); driveTimer = null; activeDir = null;
+  send("/master-stop"); toast("EMERGENCY STOP sent"); log("Emergency stop pressed", "bad");
+});
+
+// ---------- AUTO MODE ----------
+function askConfirm(){
+  return new Promise(res => {
+    const m = $("modal"); m.classList.add("show");
+    const done = v => { m.classList.remove("show"); $("mYes").onclick = $("mNo").onclick = null; res(v); };
+    $("mYes").onclick = () => done(true); $("mNo").onclick = () => done(false);
+  });
+}
+$("autoBtn").addEventListener("click", async () => {
+  if (!autoOn && !(await askConfirm())) return;
+  clearInterval(driveTimer); driveTimer = null; activeDir = null; vib(20);
+  send("/auto?state=" + (autoOn ? "0" : "1"));
+});
+
+// ---------- RADAR ----------
+const radar = {pts:[], range:200, angle:90, detect:150, hl:true};
+const cv = $("radar"), ctx = cv.getContext("2d");
+function fit(){
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(w * 0.6 * dpr); cv.style.height = (w * 0.6) + "px";
+}
+window.addEventListener("resize", fit); fit();
+document.querySelectorAll("[data-range]").forEach(b => b.addEventListener("click", () => {
+  radar.range = +b.dataset.range;
+  document.querySelectorAll("[data-range]").forEach(x => x.classList.toggle("sel", x === b));
+  radar.pts = [];
+}));
+function draw(){
+  const dpr = window.devicePixelRatio || 1, W = cv.width, H = cv.height, now = performance.now();
+  ctx.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H - 18 * dpr, R = Math.min(W / 2 - 14 * dpr, H - 34 * dpr);
+  const th = a => (radar.hl ? a : 180 - a) * Math.PI / 180;
+  const pol = (a, d) => [cx + d / radar.range * R * Math.cos(th(a)), cy - d / radar.range * R * Math.sin(th(a))];
+  ctx.lineWidth = dpr; ctx.font = (10 * dpr) + "px ui-monospace,Menlo,monospace";
+  // rings + labels
+  for (let i = 1; i <= 4; i++){
+    ctx.strokeStyle = "rgba(34,211,238,.2)"; ctx.beginPath(); ctx.arc(cx, cy, R * i / 4, Math.PI, 2 * Math.PI); ctx.stroke();
+    ctx.fillStyle = "rgba(127,155,181,.85)"; ctx.fillText(Math.round(radar.range * i / 4) + " cm", cx + 4 * dpr, cy - R * i / 4 - 3 * dpr);
+  }
+  // spokes
+  ctx.strokeStyle = "rgba(34,211,238,.12)";
+  [0, 45, 90, 135, 180].forEach(a => { const p = pol(a, radar.range); ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(p[0], p[1]); ctx.stroke(); });
+  // detect ring
+  if (radar.detect <= radar.range){
+    ctx.setLineDash([6 * dpr, 6 * dpr]); ctx.strokeStyle = "rgba(245,158,11,.7)";
+    ctx.beginPath(); ctx.arc(cx, cy, radar.detect / radar.range * R, Math.PI, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // sweep wedge + line
+  const t = th(radar.angle);
+  ctx.fillStyle = "rgba(34,211,238,.14)"; ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R, -(t + .09), -(t - .09)); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "rgba(103,232,249,.95)"; ctx.lineWidth = 2 * dpr; ctx.beginPath(); ctx.moveTo(cx, cy);
+  const e = pol(radar.angle, radar.range); ctx.lineTo(e[0], e[1]); ctx.stroke();
+  // echoes
+  radar.pts = radar.pts.filter(p => now - p.t < 5000);
+  radar.pts.forEach(p => {
+    if (p.d > radar.range) return;
+    const q = pol(p.a, p.d), al = 1 - (now - p.t) / 5000;
+    ctx.fillStyle = (p.d <= 10 ? "rgba(239,68,68," : p.d <= radar.detect ? "rgba(245,158,11," : "rgba(52,211,153,") + al + ")";
+    ctx.beginPath(); ctx.arc(q[0], q[1], 3.5 * dpr, 0, 6.3); ctx.fill();
+  });
+  // robot
+  ctx.fillStyle = "#22d3ee"; ctx.beginPath(); ctx.moveTo(cx, cy - 10 * dpr); ctx.lineTo(cx + 8 * dpr, cy + 6 * dpr); ctx.lineTo(cx - 8 * dpr, cy + 6 * dpr); ctx.fill();
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ---------- STATUS ----------
+const DIR_BTN = {FORWARD:"forward", BACKWARD:"backward", LEFT:"left", RIGHT:"right"};
+let prev = null, seqLast = -1, wasOnline = null;
+
+function syncSlider(id, labelId, v){
+  if (busy.has(id)) return;
+  $(id).value = v; $(labelId).textContent = v; paint($(id));
+}
+function setTag(el, text, cls){ el.textContent = text; el.className = "tag" + (cls ? " " + cls : ""); }
+
+function online(ok, ms){
+  const l = $("link");
+  l.className = "pill" + (ok ? "" : " off");
+  l.querySelector("b").textContent = ok ? "CONNECTED" : "OFFLINE";
+  l.querySelector("em").textContent = ok ? ms + " ms" : "";
+  document.body.classList.toggle("offline", !ok);
+  if (wasOnline !== null && wasOnline !== ok) log(ok ? "Connection restored" : "Connection lost", ok ? "good" : "bad");
+  wasOnline = ok;
+}
+
+function render(d){
+  // drive
+  setTag($("driveState"), d.drive, d.drive === "STOP" ? "" : "ok");
+  document.querySelectorAll("[data-dir]").forEach(b => b.classList.toggle("on", DIR_BTN[d.drive] === b.dataset.dir));
+
+  // conveyor
+  setTag($("conveyorState"), d.conveyor, d.conveyor === "STOP" ? "" : "ok");
+  const g = $("gear");
+  g.setAttribute("class", "gear" + (d.conveyor === "FORWARD" ? " f" : d.conveyor === "REVERSE" ? " r" : ""));
+  g.style.animationDuration = (2.4 - d.convSpeed / 100 * 2) + "s";
+  document.querySelectorAll("[data-conv]").forEach(b => b.classList.toggle("on", b.dataset.conv.toUpperCase() === d.conveyor));
+
+  // auto
+  autoOn = d.auto;
+  document.body.classList.toggle("locked", autoOn);
+  $("autoBtn").textContent = autoOn ? "■ STOP AUTO MODE" : "▶ START AUTO MODE";
+  $("autoBtn").className = autoOn ? "stop" : "go";
+  setTag($("autoTag"), autoOn ? d.autoState : "STANDBY", autoOn ? "ok" : "");
+  document.querySelectorAll("#steps span").forEach(s => s.classList.toggle("act", autoOn && s.dataset.s === d.autoState));
+  $("collected").textContent = d.collected;
+
+  // sliders
+  syncSlider("servo", "servoValue", d.servo);
+  syncSlider("driveSpeed", "driveSpeedVal", d.driveSpeed);
+  syncSlider("convSpeed", "convSpeedVal", d.convSpeed);
+  syncSlider("detect", "detectVal", d.detectCm);
+  syncSlider("swMin", "swMinVal", d.swMin);
+  syncSlider("swMax", "swMaxVal", d.swMax);
+
+  // radar + distance
+  radar.angle = d.servo; radar.hl = d.highLeft; radar.detect = d.detectCm;
+  if (d.seq !== seqLast){
+    seqLast = d.seq;
+    if (d.rDist !== null) radar.pts.push({a:d.rAngle, d:d.rDist, t:performance.now()});
+    if (radar.pts.length > 400) radar.pts.shift();
+  }
+  if (d.distance === null){
+    $("distance").textContent = "--"; $("meters").innerHTML = "&nbsp;"; $("proxBar").style.width = "0";
+    setTag($("sonarTag"), "NO ECHO", "");
+  } else {
+    $("distance").textContent = Number(d.distance).toFixed(1);
+    $("meters").textContent = (d.distance / 100).toFixed(2) + " m";
+    $("proxBar").style.width = Math.max(3, 100 - Math.min(100, d.distance / d.maxCm * 100)) + "%";
+    setTag($("sonarTag"), d.detected ? "⚠ OBJECT < 10 CM" : d.distance <= d.detectCm ? "OBJECT IN RANGE" : "AREA CLEAR",
+           d.detected ? "bad" : d.distance <= d.detectCm ? "warn" : "ok");
+  }
+
+  // environment
+  $("ldr").textContent = d.ldr;
+  $("ldrMark").style.left = "calc(" + Math.min(100, d.ldr / 4095 * 100) + "% - 3px)";
+  setTag($("sewerStatus"), d.inSewer ? "🌑 IN SEWER" : "☀️ NOT IN SEWER", d.inSewer ? "warn" : "ok");
+
+  // buzzer
+  setTag($("buzzerStatus"), d.buzzer ? "SOUNDING" : "OFF", d.buzzer ? "bad" : "");
+  $("autoBuzzer").checked = d.autoBuzzer;
+
+  // event log (state changes only)
+  if (prev){
+    if (d.drive !== prev.drive) log("Drive: " + d.drive);
+    if (d.conveyor !== prev.conveyor) log("Conveyor: " + d.conveyor);
+    if (d.auto !== prev.auto) log(d.auto ? "Auto mode started" : "Auto mode stopped", d.auto ? "good" : "warn");
+    if (d.auto && d.autoState !== prev.autoState) log("Auto: " + d.autoState);
+    if (d.collected > prev.collected) log("Object collected (#" + d.collected + ")", "good");
+    if (d.detected && !prev.detected) log("Object within 10 cm", "bad");
+    if (d.inSewer !== prev.inSewer) log(d.inSewer ? "Entered sewer (dark)" : "Left sewer (light)");
+  } else log("Console connected", "good");
+  prev = d;
+}
+
+async function poll(){
+  const t0 = performance.now(), c = new AbortController(), to = setTimeout(() => c.abort(), 1500);
+  try {
+    const r = await fetch("/status", {cache:"no-store", signal:c.signal});
+    const d = await r.json();
+    online(true, Math.round(performance.now() - t0));
+    render(d);
+  } catch(e){ online(false); }
+  finally { clearTimeout(to); setTimeout(poll, 250); }
+}
+poll();
+
+// ---------- SAFETY ----------
+// Closing or hiding the page stops the robot (and cancels auto mode: it needs the page open).
+window.addEventListener("pagehide", () => navigator.sendBeacon("/move?dir=stop"));
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopDrive(); });
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// WEB HANDLERS
+// ============================================================
+void handleRoot()
+{
+    touchClient();
+    server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleMove()
+{
+    touchClient();
+    String dir = server.arg("dir");
+
+    // In auto mode manual driving is refused; a "stop" cancels auto mode.
+    if (autoMode)
+    {
+        bool isMove = (dir == "forward" || dir == "backward" || dir == "left" || dir == "right");
+        if (isMove)
+        {
+            server.send(409, "text/plain", "Auto mode is on");
+            return;
+        }
+        autoDisable();
+        server.send(200, "text/plain", "OK");
+        return;
+    }
+
+    if      (dir == "forward")  setDrive(DRIVE_FORWARD);
+    else if (dir == "backward") setDrive(DRIVE_BACKWARD);
+    else if (dir == "left")     setDrive(DRIVE_LEFT);
+    else if (dir == "right")    setDrive(DRIVE_RIGHT);
+    else                        setDrive(DRIVE_STOP);
+
+    server.send(200, "text/plain", "OK");
+}
+
+void handleConveyor()
+{
+    touchClient();
+    if (autoMode)
+    {
+        server.send(409, "text/plain", "Auto mode is on");
+        return;
+    }
+
+    String state = server.arg("state");
+
+    if      (state == "forward") setConveyor(CONV_FORWARD);
+    else if (state == "reverse") setConveyor(CONV_REVERSE);
+    else                         setConveyor(CONV_STOP);
+
+    server.send(200, "text/plain", "OK");
+}
+
+void handleSpeed()
+{
+    touchClient();
+    if (!server.hasArg("target") || !server.hasArg("value"))
+    {
+        server.send(400, "text/plain", "Missing target/value");
+        return;
+    }
+
+    int pct = constrain(server.arg("value").toInt(), MIN_SPEED_PCT, 100);
+    String target = server.arg("target");
+
+    if (target == "drive")
+    {
+        driveSpeed = pctToPwm(pct);
+        applyDrive();
+    }
+    else if (target == "conveyor")
+    {
+        conveyorSpeed = pctToPwm(pct);
+        applyConveyor();
+    }
+    else
+    {
+        server.send(400, "text/plain", "Bad target");
+        return;
+    }
+    server.send(200, "text/plain", "OK");
+}
+
+void handleAuto()
+{
+    touchClient();
+    if (!server.hasArg("state"))
+    {
+        server.send(400, "text/plain", "Missing state");
+        return;
+    }
+
+    if (server.arg("state") == "1") { if (!autoMode) autoEnable(); }
+    else                            autoDisable();
+
+    server.send(200, "text/plain", "OK");
+}
+
+// Live tuning of auto mode: /auto-config?detect=150&min=0&max=180
+void handleAutoConfig()
+{
+    touchClient();
+
+    int mn = autoSweepMin;
+    int mx = autoSweepMax;
+    if (server.hasArg("min")) mn = constrain(server.arg("min").toInt(), 0, 160);
+    if (server.hasArg("max")) mx = constrain(server.arg("max").toInt(), 20, 180);
+
+    if (mx - mn < 20)
+    {
+        server.send(400, "text/plain", "Sweep range must be at least 20 degrees");
+        return;
+    }
+
+    if (server.hasArg("detect"))
+        autoDetectCm = constrain(server.arg("detect").toFloat(), 20.0f, SONAR_MAX_CM);
+
+    autoSweepMin = mn;
+    autoSweepMax = mx;
+    server.send(200, "text/plain", "OK");
+}
+
+void handleServo()
+{
+    touchClient();
+    if (!server.hasArg("angle"))
+    {
+        server.send(400, "text/plain", "Missing angle");
+        return;
+    }
+
+    if (autoMode)
+    {
+        server.send(409, "text/plain", "Auto mode is on");
+        return;
+    }
+
+    servoWrite(server.arg("angle").toInt());
+    server.send(200, "text/plain", "OK");
+}
+
+void handleBuzzer()
+{
+    touchClient();
+    if (server.hasArg("auto"))
+    {
+        autoBuzzer = server.arg("auto") == "1";
+        if (!autoBuzzer && !manualBuzzer) setBuzzer(false);
+        server.send(200, "text/plain", "OK");
+    }
+    else if (server.hasArg("test"))
+    {
+        manualBuzzer = true;
+        manualBuzzerUntil = millis() + 300;
+        setBuzzer(true);
+        server.send(200, "text/plain", "OK");
+    }
+    else
+    {
+        server.send(400, "text/plain", "Invalid buzzer request");
+    }
+}
+
+void handleMasterStop()
+{
+    touchClient();
+    autoDisable();   // also stops everything
+    manualBuzzer = false;
+    setBuzzer(false);
+    server.send(200, "text/plain", "MASTER STOP");
+}
+
+void handleFavicon()
+{
+    server.send(204, "text/plain", "");
+}
+
+void handleNotFound()
+{
+    server.send(404, "text/plain", "Not found: " + server.uri());
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+
+    // Motors (also sets them to a safe stopped state)
+    motorInit(wheelLeft);
+    motorInit(wheelRight);
+    motorInit(conveyorA);
+    motorInit(conveyorB);
+
+    // Buzzer
+    pinMode(BUZZER_PIN, OUTPUT);
+    setBuzzer(false);
+
+    // Ultrasonic
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    digitalWrite(TRIG_PIN, LOW);
+    attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echoISR, CHANGE);
+
+    // LDR
+    pinMode(LDR_PIN, INPUT);
+    analogReadResolution(12);
+
+    // Servo
+    pwmAttach(SERVO_PIN, SERVO_CH, SERVO_FREQ, SERVO_BITS);
+    servoWrite(servoAngle);
+
+    // WiFi access point
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);   // lower latency
+    if (!WiFi.softAP(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL, 0, WIFI_MAX_CLIENTS))
+    {
+        Serial.println("ERROR: failed to start access point");
+    }
+
+    // Web server routes
+    server.on("/",            handleRoot);
+    server.on("/move",        handleMove);
+    server.on("/conveyor",    handleConveyor);
+    server.on("/speed",       handleSpeed);
+    server.on("/auto",        handleAuto);
+    server.on("/auto-config", handleAutoConfig);
+    server.on("/servo",       handleServo);
+    server.on("/buzzer",      handleBuzzer);
+    server.on("/status",      handleStatus);
+    server.on("/master-stop", handleMasterStop);
+    server.on("/favicon.ico", handleFavicon);
+    server.onNotFound(handleNotFound);
+    server.begin();
+
+    lastClientContact = millis();
+
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("      SEWER CLEANING ROBOT - ESP32");
+    Serial.println("==========================================");
+    Serial.printf("WiFi: %s\n", WIFI_SSID);
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.println("Web server: STARTED");
+    Serial.println("==========================================");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop()
+{
+    server.handleClient();
+
+    updateUltrasonic();
+    updateLDR();
+    updateBuzzer();
+    autoUpdate();
+
+    unsigned long now = millis();
+
+    // Safety: stop wheels if the controller stops sending drive commands
+    if (!autoMode && driveState != DRIVE_STOP && now - lastDriveCommand > DRIVE_TIMEOUT)
+    {
+        setDrive(DRIVE_STOP);
+    }
+
+    // Safety: no phone connected, or the page went silent -> stop everything
+    bool somethingRunning = (driveState != DRIVE_STOP) || (conveyorState != CONV_STOP);
+    bool clientLost = (WiFi.softAPgetStationNum() == 0 || now - lastClientContact > CLIENT_TIMEOUT);
+    if (clientLost)
+    {
+        if (autoMode)               autoDisable();   // auto mode needs the page open
+        else if (somethingRunning)  stopAll();
+    }
+
+    delay(1);
+}
