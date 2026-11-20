@@ -36,6 +36,7 @@ Course: [bot engineering ]   Submission date: [20/11/26 ]
 - Tested the hardware and software, and fixed problems along the way
 - Built the robot's mechanical assembly: wheels, caster wheel, four DC motors (two drive wheels, two conveyor), SG90 servo mechanism
 - Provided technical details and firmware setup info for the GitHub documentation
+
 **[Arisha Siddiqua]**
 - Designed the complete CAD model of the robot
 - Worked on the chassis (building and editing) with Adrit
