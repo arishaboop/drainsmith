@@ -101,9 +101,10 @@ drainsmith/
 ```
 
 ## 9. CAD Design
-The complete CAD model of the robot was designed by [Arisha Siddiqua] in [Autodesk Fusion360]. The files are in the [`cad/`](cad/) folder as `.step` files.
+The complete CAD model of the robot was designed by Arisha Siddiqua in Autodesk Fusion360. The files are saved as `.step` files.
 
 <img width="1156" height="685" alt="image" src="https://github.com/user-attachments/assets/ad1803fe-0141-4af4-8a0e-806cd040a304" />
+wheels are replaced with turbine wheels when in water 
 
 
 ## 10. Setup Instructions
