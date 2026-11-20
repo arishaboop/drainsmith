@@ -1,6 +1,6 @@
 # 🤖 Drainsmith: Sewer Cleaning Robot
 
-> A WiFi-controlled ESP32 robot that enters sewer pipes, collects solid waste from the sewage with a conveyor, and uses a servo-mounted ultrasonic sensor to look for debris and obstacles ahead.
+> A WiFi-controlled ESP32 robot that enters sewer pipes, collects solid waste from the sewage with a conveyor, and uses a servo-mounted ultrasonic sensor to look for debris and obstacles ahead. 
 
 ## 🎥 Project Demonstration
 **YouTube video:** [https://youtube.com/shorts/10egf3e7s6U?si=kcGcTMeceQTyW7_x]
